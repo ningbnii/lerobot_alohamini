@@ -128,6 +128,7 @@ def build_robot_metadata(robot: AlohaMini) -> dict:
     metadata = {
         "schema_version": 1,
         "robot_model": robot.config.robot_model,
+        "is_calibrated": bool(getattr(robot, "is_calibrated", False)),
         "motors": motors,
         "cameras": list(robot.cameras),
     }
@@ -202,6 +203,12 @@ def main():
         default=None,
         help="Override the dedicated ROS camera PUB port.",
     )
+    parser.add_argument(
+        "--allow-uncalibrated",
+        action="store_true",
+        default=True,
+        help="Allow host to start in uncalibrated safe mode without blocking on terminal stdin.",
+    )
     args = parser.parse_args()
 
     logging.info("Configuring AlohaMini")
@@ -213,8 +220,8 @@ def main():
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
 
-    logging.info("Connecting AlohaMini")
-    robot.connect()
+    logging.info("Connecting AlohaMini (allow_uncalibrated=%s)", args.allow_uncalibrated)
+    robot.connect(calibrate=not args.allow_uncalibrated)
     robot_metadata = build_robot_metadata(robot)
 
     logging.info("Starting HostAgent")

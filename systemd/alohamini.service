@@ -1,0 +1,28 @@
+[Unit]
+Description=AlohaMini Robot Host and Edge Telemetry Service
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi5
+Group=pi5
+WorkingDirectory=/home/pi5/lerobot_alohamini
+Environment=PYTHONPATH=/home/pi5/lerobot_alohamini/src:src
+Environment=PATH=/home/pi5/miniconda3/envs/lerobot_alohamini/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi5/miniconda3/envs/lerobot_alohamini/bin/python -m lerobot.robots.alohamini.alohamini_host --robot_model alohamini2 --allow-uncalibrated --camera-stream
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Hardware access permissions
+SupplementaryGroups=dialout video
+
+# Kill mode
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

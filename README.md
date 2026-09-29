@@ -18,6 +18,21 @@ Start with setup, then follow the workflow for your hardware. Use the reference 
    - [AM-ARM200](docs/alohamini/am-arm200.md) — single-arm workflow on one PC: calibration, teleoperation, dataset recording, training, and evaluation.
    - [AlohaMini 1 / 2 / 2 Pro](docs/alohamini/alohamini.md) — dual-arm workflow with Pi + PC: calibration, teleoperation, dataset recording, training, and evaluation.
 
+### AlohaLab Edge Agent (工位边缘守护进程)
+
+工位电脑作为边缘代理（Agent），下连树莓派小车硬件（ZMQ :5555 / :5557），上接 Web 实训平台（WebRTC P2P 直连）：
+
+```bash
+# 方式 1：一键脚本启动（内置树莓派网络与端口探活）
+bash scripts/start_agent.sh
+
+# 方式 2：原生 Python 虚拟环境启动
+source .venv/bin/activate
+python -m agent.main --robot-host-ip 192.168.8.109 --robot-model alohamini2
+```
+
+---
+
 ### References
 
 | Reference | Use it for |
