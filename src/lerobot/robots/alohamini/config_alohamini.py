@@ -32,12 +32,20 @@ def alohamini_cameras_config() -> dict[str, CameraConfig]:
         # "backward": OpenCVCameraConfig(
         #     index_or_path="/dev/am_camera_backward", fps=30, width=640, height=480, rotation=Cv2Rotation.NO_ROTATION
         # ),
-        # "chest": OpenCVCameraConfig(
-        #     index_or_path="/dev/am_camera_chest", fps=30, width=640, height=480, rotation=Cv2Rotation.NO_ROTATION
-        # ),
-        # "wrist_left": OpenCVCameraConfig(
-        #     index_or_path="/dev/am_camera_wrist_left", fps=30, width=640, height=480, rotation=Cv2Rotation.NO_ROTATION
-        # ),
+        "chest": OpenCVCameraConfig(
+            index_or_path="/dev/am_camera_chest",
+            fps=30,
+            width=640,
+            height=480,
+            rotation=Cv2Rotation.NO_ROTATION,
+        ),
+        "wrist_left": OpenCVCameraConfig(
+            index_or_path="/dev/am_camera_wrist_left",
+            fps=30,
+            width=640,
+            height=480,
+            rotation=Cv2Rotation.NO_ROTATION,
+        ),
         "wrist_right": OpenCVCameraConfig(
             index_or_path="/dev/am_camera_wrist_right",
             fps=30,

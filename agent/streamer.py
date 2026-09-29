@@ -22,6 +22,20 @@ from agent.config import AgentConfig
 logger = logging.getLogger(__name__)
 
 
+# Canonical physical cameras: forward / backward / chest / wrist_left / wrist_right.
+# Legacy SaaS names resolve here (lookup only, never advertised as cameras).
+LEGACY_CAMERA_ALIASES = {
+    "top": "forward",
+    "alohamini_top": "forward",
+    "alohamini_forward": "forward",
+    "wrist": "wrist_right",
+    "alohamini_wrist": "wrist_right",
+    "alohamini_wrist_right": "wrist_right",
+    "alohamini_wrist_left": "wrist_left",
+    "alohamini_chest": "chest",
+}
+
+
 def is_private_ip(ip_str: str) -> bool:
     """Check if an IP address belongs to RFC 1918 private subnets."""
     try:
@@ -96,24 +110,11 @@ class ZMQCameraStreamSubscriber:
                     meta_raw = parts[1].decode("utf-8")
                     jpeg_bytes = parts[2]
                     with self._lock:
-                        # Register exact topic and friendly aliases
+                        # Store only the exact topic and its physical base name.
+                        # Legacy names (top/wrist/...) resolve via LEGACY_CAMERA_ALIASES
+                        # at lookup time so /api/cameras never lists duplicates.
                         self.latest_frames[topic] = jpeg_bytes
-                        base_name = topic.removeprefix("camera/")
-                        self.latest_frames[base_name] = jpeg_bytes
-
-                        # Map forward camera to top/alohamini_top aliases
-                        if base_name in ("forward", "am_camera_forward"):
-                            self.latest_frames["forward"] = jpeg_bytes
-                            self.latest_frames["top"] = jpeg_bytes
-                            self.latest_frames["alohamini_top"] = jpeg_bytes
-                            self.latest_frames["alohamini_forward"] = jpeg_bytes
-
-                        # Map wrist camera to wrist/alohamini_wrist aliases
-                        if "wrist" in base_name:
-                            self.latest_frames["wrist"] = jpeg_bytes
-                            self.latest_frames["wrist_right"] = jpeg_bytes
-                            self.latest_frames["alohamini_wrist"] = jpeg_bytes
-
+                        self.latest_frames[topic.removeprefix("camera/")] = jpeg_bytes
                         try:
                             self.latest_metadata[topic] = json.loads(meta_raw)
                         except Exception:
@@ -125,22 +126,29 @@ class ZMQCameraStreamSubscriber:
         ctx.term()
 
     def get_latest_frame(self, camera_name: str) -> bytes | None:
+        # Legacy compat: top/alohamini_* resolve to physical cameras at lookup.
+        camera_name = LEGACY_CAMERA_ALIASES.get(camera_name, camera_name)
         with self._lock:
-            # Try direct lookup, alias lookup, or return any frame if only one camera exists
+            # Try direct lookup, topic lookup, or return any frame if only one camera exists
             frame = self.latest_frames.get(camera_name)
             if frame is not None:
                 return frame
-            if camera_name in ("top", "alohamini_top", "forward"):
-                return self.latest_frames.get("forward") or self.latest_frames.get("camera/forward")
-            if camera_name in ("wrist", "alohamini_wrist", "wrist_right"):
-                return self.latest_frames.get("wrist_right") or self.latest_frames.get("camera/wrist_right")
+            frame = self.latest_frames.get(f"camera/{camera_name}")
+            if frame is not None:
+                return frame
             if self.latest_frames:
                 return next(iter(self.latest_frames.values()))
             return None
 
     def get_available_cameras(self) -> list[str]:
+        # Only physical cameras (camera/<name> topics), never legacy aliases.
         with self._lock:
-            return [k for k in self.latest_frames.keys() if not k.startswith("camera/") and not k.startswith("alohamini_")]
+            names = {
+                k.removeprefix("camera/")
+                for k in self.latest_frames.keys()
+                if k.startswith("camera/")
+            }
+            return sorted(names)
 
 
 class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -280,8 +288,11 @@ class VideoBridge:
         http_base = f"http://127.0.0.1:{self.config.camera_http_port}"
         streams = {
             "alohamini_forward": f"{http_base}/stream/forward",
-            "alohamini_top": f"{http_base}/stream/forward",
-            "alohamini_wrist": f"{http_base}/stream/wrist_right",
+            "alohamini_top": f"{http_base}/stream/forward",  # legacy: top == forward
+            "alohamini_chest": f"{http_base}/stream/chest",
+            "alohamini_wrist_left": f"{http_base}/stream/wrist_left",
+            "alohamini_wrist": f"{http_base}/stream/wrist_right",  # legacy name
+            "alohamini_wrist_right": f"{http_base}/stream/wrist_right",
         }
         success = True
         for name, src in streams.items():
