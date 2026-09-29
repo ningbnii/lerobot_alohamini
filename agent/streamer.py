@@ -1,15 +1,21 @@
 """
 Video bridge and WebRTC P2P signaling manager via go2rtc.
 Enforces ADR-023: same-LAN host ICE candidates only, 0 bps cloud media egress.
+Provides direct ZeroMQ JPEG subscription and local HTTP MJPEG streaming fallback.
 """
 
 from __future__ import annotations
 
 import json
+import time
 import logging
-import urllib.request
-import urllib.error
+import threading
 import ipaddress
+import urllib.request
+import urllib.parse
+import urllib.error
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from typing import Any
 from agent.config import AgentConfig
 
@@ -25,12 +31,223 @@ def is_private_ip(ip_str: str) -> bool:
         return False
 
 
+class ZMQCameraStreamSubscriber:
+    """
+    Subscribes directly to Raspberry Pi Host's CameraStreamPublisher (:5557).
+    Receives multipart [topic, metadata_json, jpeg_bytes] and buffers the latest frames.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 5557) -> None:
+        self.endpoint = f"tcp://{host}:{port}"
+        self.latest_frames: dict[str, bytes] = {}
+        self.latest_metadata: dict[str, Any] = {}
+        self._running = False
+        self._thread: Any = None
+        self._lock = threading.Lock()
+
+    def start(self) -> bool:
+        try:
+            import zmq
+        except ImportError:
+            logger.warning("pyzmq is not installed; ZMQCameraStreamSubscriber disabled.")
+            return False
+
+        if self._running:
+            return True
+
+        self._running = True
+        self._thread = threading.Thread(target=self._subscriber_loop, daemon=True)
+        self._thread.start()
+        logger.info("ZMQ camera subscriber started for %s", self.endpoint)
+        return True
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _subscriber_loop(self) -> None:
+        import zmq
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.CONFLATE, 1)  # only keep latest frame per camera
+        sock.setsockopt_string(zmq.SUBSCRIBE, "")  # subscribe to all topics
+        sock.connect(self.endpoint)
+
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+
+        while self._running:
+            try:
+                socks = dict(poller.poll(500))
+                if sock in socks and socks[sock] == zmq.POLLIN:
+                    parts = sock.recv_multipart(flags=zmq.NOBLOCK)
+                    if len(parts) >= 3:
+                        topic = parts[0].decode("utf-8")
+                        meta_raw = parts[1].decode("utf-8")
+                        jpeg_bytes = parts[2]
+                        with self._lock:
+                            # Register exact topic and friendly aliases
+                            self.latest_frames[topic] = jpeg_bytes
+                            base_name = topic.removeprefix("camera/")
+                            self.latest_frames[base_name] = jpeg_bytes
+
+                            # Map forward camera to top/alohamini_top aliases
+                            if base_name in ("forward", "am_camera_forward"):
+                                self.latest_frames["forward"] = jpeg_bytes
+                                self.latest_frames["top"] = jpeg_bytes
+                                self.latest_frames["alohamini_top"] = jpeg_bytes
+                                self.latest_frames["alohamini_forward"] = jpeg_bytes
+
+                            # Map wrist camera to wrist/alohamini_wrist aliases
+                            if "wrist" in base_name:
+                                self.latest_frames["wrist"] = jpeg_bytes
+                                self.latest_frames["wrist_right"] = jpeg_bytes
+                                self.latest_frames["alohamini_wrist"] = jpeg_bytes
+
+                            try:
+                                self.latest_metadata[topic] = json.loads(meta_raw)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.debug("ZMQ subscriber read notice: %s", e)
+
+        sock.close()
+        ctx.term()
+
+    def get_latest_frame(self, camera_name: str) -> bytes | None:
+        with self._lock:
+            # Try direct lookup, alias lookup, or return any frame if only one camera exists
+            frame = self.latest_frames.get(camera_name)
+            if frame is not None:
+                return frame
+            if camera_name in ("top", "alohamini_top", "forward"):
+                return self.latest_frames.get("forward") or self.latest_frames.get("camera/forward")
+            if camera_name in ("wrist", "alohamini_wrist", "wrist_right"):
+                return self.latest_frames.get("wrist_right") or self.latest_frames.get("camera/wrist_right")
+            if self.latest_frames:
+                return next(iter(self.latest_frames.values()))
+            return None
+
+    def get_available_cameras(self) -> list[str]:
+        with self._lock:
+            return [k for k in self.latest_frames.keys() if not k.startswith("camera/") and not k.startswith("alohamini_")]
+
+
+class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+class _MJPEGHTTPHandler(BaseHTTPRequestHandler):
+    """Serves JPEG snapshots and multipart MJPEG video streams over HTTP."""
+
+    subscriber: ZMQCameraStreamSubscriber | None = None
+
+    def log_message(self, format, *args):
+        # Silence routine HTTP request logging
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        query = urllib.parse.parse_qs(parsed.query)
+
+        # 1. API: List available cameras
+        if path in ("/api/cameras", "/cameras"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            cams = self.subscriber.get_available_cameras() if self.subscriber else []
+            self.wfile.write(json.dumps({"cameras": cams}).encode("utf-8"))
+            return
+
+        # Determine camera name
+        cam_name = query.get("cam", ["forward"])[0]
+        if path.startswith("/stream/"):
+            cam_name = path.removeprefix("/stream/")
+        elif path.startswith("/camera/") or path.startswith("/snapshot/"):
+            cam_name = path.split("/")[-1]
+
+        # 2. MJPEG Stream
+        if path.startswith("/stream") or query.get("type", [""])[0] == "mjpeg":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            try:
+                while True:
+                    frame = self.subscriber.get_latest_frame(cam_name) if self.subscriber else None
+                    if frame is not None:
+                        header = (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n"
+                            + f"Content-Length: {len(frame)}\r\n\r\n".encode()
+                        )
+                        self.wfile.write(header + frame + b"\r\n")
+                    time.sleep(0.033)  # ~30 FPS
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        # 3. Single JPEG Snapshot
+        frame = self.subscriber.get_latest_frame(cam_name) if self.subscriber else None
+        if frame is not None:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(frame)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(frame)
+        else:
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Camera frame not available yet")
+
+
 class VideoBridge:
-    """Manages go2rtc stream registration and WebRTC SDP handshake."""
+    """Manages go2rtc stream registration, local HTTP MJPEG server, and WebRTC SDP handshake."""
 
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
         self.go2rtc_url = config.go2rtc_api_url.rstrip("/")
+        self.subscriber = ZMQCameraStreamSubscriber(
+            host=config.robot_host_ip,
+            port=config.port_zmq_camera_stream,
+        )
+        self.http_server: HTTPServer | None = None
+        self._server_thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Start both ZMQ subscriber and local HTTP streaming server."""
+        self.subscriber.start()
+
+        # Start HTTP server on camera_http_port
+        handler_cls = _MJPEGHTTPHandler
+        handler_cls.subscriber = self.subscriber
+        try:
+            self.http_server = _ThreadedHTTPServer(("0.0.0.0", self.config.camera_http_port), handler_cls)
+            self._server_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+            self._server_thread.start()
+            logger.info("Local Camera HTTP/MJPEG streaming server listening on port %d", self.config.camera_http_port)
+        except Exception as e:
+            logger.warning("Could not bind Camera HTTP streaming server on port %d: %s", self.config.camera_http_port, e)
+
+        # Register with go2rtc if running
+        if self.is_healthy():
+            self.register_streams()
+
+    def stop(self) -> None:
+        """Stop subscriber and HTTP server."""
+        self.subscriber.stop()
+        if self.http_server:
+            try:
+                self.http_server.shutdown()
+            except Exception:
+                pass
+            self.http_server = None
 
     def is_healthy(self) -> bool:
         """Check if go2rtc is running locally."""
@@ -46,32 +263,45 @@ class VideoBridge:
 
     def register_streams(self) -> bool:
         """
-        Register camera streams from Pi ZMQ/RTSP into go2rtc.
-        alohamini_top: ZMQ camera stream from Raspberry Pi Host
-        alohamini_wrist: ZMQ camera stream from Raspberry Pi Host
+        Register camera streams into local go2rtc (compatible with go2rtc 1.8 & 1.9.14).
+        Feeds from local HTTP MJPEG server, avoiding raw TCP ZMQ wire decode errors.
         """
+        http_base = f"http://127.0.0.1:{self.config.camera_http_port}"
         streams = {
-            "alohamini_top": f"ffmpeg:tcp://{self.config.robot_host_ip}:{self.config.port_zmq_camera_stream}#video=h264",
-            "alohamini_wrist": f"ffmpeg:tcp://{self.config.robot_host_ip}:{self.config.port_zmq_camera_stream}#video=h264",
+            "alohamini_forward": f"{http_base}/stream/forward",
+            "alohamini_top": f"{http_base}/stream/forward",
+            "alohamini_wrist": f"{http_base}/stream/wrist_right",
         }
         success = True
         for name, src in streams.items():
-            url = f"{self.go2rtc_url}/api/streams?src={urllib.parse.quote(src)}&name={name}"
+            # 1. Try go2rtc 1.9+ JSON POST
+            post_url = f"{self.go2rtc_url}/api/streams"
             try:
-                req = urllib.request.Request(url, method="PUT")
+                payload = json.dumps({"name": name, "channels": [src]}).encode("utf-8")
+                req = urllib.request.Request(post_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                    if resp.status in (200, 201):
+                        continue
+            except Exception:
+                pass
+
+            # 2. Fallback to PUT query param
+            put_url = f"{self.go2rtc_url}/api/streams?src={urllib.parse.quote(src)}&name={name}"
+            try:
+                req = urllib.request.Request(put_url, method="PUT")
                 with urllib.request.urlopen(req, timeout=2.0) as resp:
                     if resp.status not in (200, 201):
                         success = False
             except Exception as e:
                 logger.debug("Stream registration notice (%s): %s", name, e)
+                success = False
+
+        if success:
+            logger.info("Successfully registered camera streams (%s) into go2rtc", list(streams.keys()))
         return success
 
-
     def handle_sdp_offer(self, stream_name: str, client_sdp_offer: str) -> str | None:
-        """
-        Post SDP offer to go2rtc and retrieve answer.
-        Validates that connection remains local.
-        """
+        """Post SDP offer to go2rtc and retrieve answer."""
         url = f"{self.go2rtc_url}/api/webrtc?src={urllib.parse.quote(stream_name)}"
         try:
             data = client_sdp_offer.encode("utf-8")
@@ -86,11 +316,7 @@ class VideoBridge:
             return None
 
     def validate_ice_candidate(self, candidate_line: str) -> bool:
-        """
-        Enforce ADR-023:
-        Must only accept 'host' candidate with RFC 1918 private IP.
-        Must REJECT srflx and relay candidates.
-        """
+        """Enforce ADR-023: Must only accept host candidates with RFC 1918 private IP."""
         parts = candidate_line.strip().split()
         if len(parts) < 8:
             return False
@@ -111,70 +337,3 @@ class VideoBridge:
             return True
         except (ValueError, IndexError):
             return False
-
-
-class ZMQCameraStreamSubscriber:
-    """
-    Subscribes directly to Raspberry Pi Host's CameraStreamPublisher (:5557).
-    Receives multipart [topic, metadata_json, jpeg_bytes] and buffers the latest frames.
-    """
-
-    def __init__(self, host: str = "127.0.0.1", port: int = 5557) -> None:
-        self.endpoint = f"tcp://{host}:{port}"
-        self.latest_frames: dict[str, bytes] = {}
-        self.latest_metadata: dict[str, Any] = {}
-        self._running = False
-        self._thread: Any = None
-        self._lock = __import__("threading").Lock()
-
-    def start(self) -> bool:
-        try:
-            import zmq
-        except ImportError:
-            logger.warning("pyzmq is not installed; ZMQCameraStreamSubscriber disabled.")
-            return False
-
-        self._running = True
-        self._thread = __import__("threading").Thread(target=self._subscriber_loop, daemon=True)
-        self._thread.start()
-        return True
-
-    def stop(self) -> None:
-        self._running = False
-
-    def _subscriber_loop(self) -> None:
-        import zmq
-        ctx = zmq.Context()
-        sock = ctx.socket(zmq.SUB)
-        sock.setsockopt(zmq.CONFLATE, 1)  # only keep latest frame per camera
-        sock.setsockopt_string(zmq.SUBSCRIBE, "")  # subscribe to all topics ('top', 'wrist')
-        sock.connect(self.endpoint)
-
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
-
-        while self._running:
-            try:
-                socks = dict(poller.poll(500))
-                if sock in socks and socks[sock] == zmq.POLLIN:
-                    parts = sock.recv_multipart(flags=zmq.NOBLOCK)
-                    if len(parts) >= 3:
-                        topic = parts[0].decode("utf-8")
-                        meta_raw = parts[1].decode("utf-8")
-                        jpeg_bytes = parts[2]
-                        with self._lock:
-                            self.latest_frames[topic] = jpeg_bytes
-                            try:
-                                self.latest_metadata[topic] = json.loads(meta_raw)
-                            except Exception:
-                                pass
-            except Exception as e:
-                logger.debug("ZMQ subscriber read notice: %s", e)
-
-        sock.close()
-        ctx.term()
-
-    def get_latest_frame(self, camera_name: str) -> bytes | None:
-        with self._lock:
-            return self.latest_frames.get(camera_name)
-

@@ -421,17 +421,18 @@ class TeleopInputReceiver:
     def build_zmq_action_payload(self) -> dict[str, float]:
         """
         Build a payload dictionary formatted for AlohaMini Host's ZMQ PULL socket (:5555).
-        Includes base velocities (x.vel, y.vel, theta.vel) and lift velocity (lift_axis.vel).
+        Strictly matches AlohaMini action_features:
+          - Base: x.vel, y.vel, theta.vel
+          - Lift: lift_axis.height_mm (0.0 to 300.0 mm)
         Zeroed out when watchdog is expired or during E-Stop.
         """
         vx, vy, vyaw = self.get_base_velocities()
-        lift_dir = self.get_lift_direction()
-        lift_vel = 1000.0 * float(lift_dir)
+        # Enforce kinematic soft limit tracked height (in mm)
+        lift_height_mm = float(self.limits.current_lift_height_mm)
         return {
             "x.vel": float(vx),
             "y.vel": float(vy),
             "theta.vel": float(vyaw),
-            "lift_axis.vel": float(lift_vel),
-            "gripper.pos": float(self.get_gripper_position()),
+            "lift_axis.height_mm": lift_height_mm,
         }
 

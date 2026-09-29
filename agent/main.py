@@ -53,12 +53,8 @@ class AlohaMiniAgent:
                 self.config.robot_host_ip = effective_ip
                 logger.info("Auto-resolved robot IP to %s (via MAC %s)", effective_ip, binding.target_mac)
 
-        # 1. Register camera video streams with local go2rtc
-        if self.streamer.is_healthy():
-            logger.info("go2rtc detected at %s, registering camera streams...", self.config.go2rtc_api_url)
-            self.streamer.register_streams()
-        else:
-            logger.warning("go2rtc not detected at %s. Video streaming will activate once go2rtc starts.", self.config.go2rtc_api_url)
+        # 1. Start camera streaming bridge and HTTP server
+        self.streamer.start()
 
         # 2. Start heartbeat thread
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
@@ -74,6 +70,7 @@ class AlohaMiniAgent:
         """Stop the agent and all ongoing tasks."""
         logger.info("Stopping AlohaMini Agent...")
         self._running = False
+        self.streamer.stop()
         self.teleop.trigger_estop()
         self.recorder.stop_recording(force=True)
         logger.info("AlohaMini Agent stopped.")

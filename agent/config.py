@@ -56,6 +56,9 @@ class AgentConfig:
     port_zmq_camera_stream: int = field(
         default_factory=lambda: int(os.getenv("PORT_ZMQ_CAMERA_STREAM", "5557"))
     )
+    camera_http_port: int = field(
+        default_factory=lambda: int(os.getenv("CAMERA_HTTP_PORT", "8088"))
+    )
 
     @property
     def zmq_cmd_url(self) -> str:
