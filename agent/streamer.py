@@ -34,12 +34,15 @@ class VideoBridge:
 
     def is_healthy(self) -> bool:
         """Check if go2rtc is running locally."""
-        try:
-            req = urllib.request.Request(f"{self.go2rtc_url}/api/version", method="GET")
-            with urllib.request.urlopen(req, timeout=1.0) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+        for path in ("/api/version", "/api"):
+            try:
+                req = urllib.request.Request(f"{self.go2rtc_url}{path}", method="GET")
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                continue
+        return False
 
     def register_streams(self) -> bool:
         """

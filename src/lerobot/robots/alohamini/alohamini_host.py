@@ -146,6 +146,35 @@ def observation_request_includes_cameras(request_token: bytes | None) -> bool:
     return request_token is not None and not request_token.endswith(b":state")
 
 
+def build_degraded_observation(robot, include_cameras: bool, error: BaseException) -> dict:
+    """Uncalibrated safe mode: serve cameras + metadata without normalized joints.
+
+    ``--allow-uncalibrated`` lets the Host bind 5555/5556/5557 so the SaaS
+    platform can visualize cameras and guide students through calibration.
+    Motion stays disabled until calibration succeeds.
+    """
+    obs: dict = {
+        "_degraded": True,
+        "_uncalibrated_error": f"{type(error).__name__}: {error}",
+        "is_calibrated": False,
+    }
+    if include_cameras:
+        for cam_key, cam in robot.cameras.items():
+            try:
+                obs[cam_key] = cam.read_latest(max_age_ms=500)
+            except Exception as exc:  # noqa: BLE001 - one bad camera must not kill the loop
+                logging.debug("Degraded camera %s unavailable: %s", cam_key, exc)
+    now = time.perf_counter()
+    obs["_host_timing"] = {
+        "state_sample_started_monotonic_s": now,
+        "state_sample_finished_monotonic_s": now,
+        "state_sample_unix_ns": time.time_ns(),
+        "host_clock_reference": {"monotonic_s": now, "unix_ns": time.time_ns()},
+        "camera_capture_monotonic_s": {},
+    }
+    return obs
+
+
 def parse_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -280,6 +309,7 @@ def main():
         timing_totals_ms: dict[str, float] = {}
         timing_command_count = 0
         action_timing_totals_ms: dict[str, float] = {}
+        degraded_logged = False
         while duration < host.connection_time_s:
             loop_start_t = time.perf_counter()
             command_received = False
@@ -301,13 +331,31 @@ def main():
 
             # One feedback snapshot owns the complete observe -> act cycle.
             # send_action() reuses its position/current values for safety limits.
-            last_observation = robot.get_observation(include_cameras=include_cameras)
+            # Uncalibrated safe mode: never crash the loop on calibration errors.
+            # Serve cameras + metadata so SaaS can guide students to calibrate.
+            try:
+                last_observation = robot.get_observation(include_cameras=include_cameras)
+                degraded_mode = False
+            except (RuntimeError, KeyError) as obs_error:
+                if degraded_logged is False:
+                    logging.warning(
+                        "Uncalibrated safe mode: joint state unavailable (%s). "
+                        "Serving cameras only; motion disabled until calibrated.",
+                        obs_error,
+                    )
+                    degraded_logged = True
+                last_observation = build_degraded_observation(robot, include_cameras, obs_error)
+                degraded_mode = True
             # send_action() consumes/clears this cycle's cached feedback. Preserve only
             # the small current snapshot needed by the once-per-second tracking report.
-            tracking_currents_ma = {
-                motor: float(raw) * 6.5 for motor, raw in robot._feedback_currents_raw.items()
-            }
+            try:
+                tracking_currents_ma = {
+                    motor: float(raw) * 6.5 for motor, raw in robot._feedback_currents_raw.items()
+                }
+            except Exception:  # noqa: BLE001 - degraded mode has no feedback cache
+                tracking_currents_ma = {}
             observation_done_t = time.perf_counter()
+            robot_metadata["is_calibrated"] = bool(getattr(robot, "is_calibrated", False))
 
             # Expire the lease before reading queued commands, including the same owner's.
             watchdog_tripped = (
@@ -370,7 +418,12 @@ def main():
             command_done_t = time.perf_counter()
 
             action_sent = False
-            if command_received:
+            if degraded_mode:
+                # Uncalibrated safe mode: refuse all motion, keep serving cameras.
+                if command_received:
+                    logging.warning("Rejecting motion command: robot uncalibrated.")
+                    command_received = False
+            elif command_received:
                 last_sent_action = robot.send_action(latest_action)
                 action_sent = True
             elif not watchdog_tripped:
