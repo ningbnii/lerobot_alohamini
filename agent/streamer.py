@@ -23,17 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 # Canonical physical cameras: forward / backward / chest / wrist_left / wrist_right.
-# Legacy SaaS names resolve here (lookup only, never advertised as cameras).
-LEGACY_CAMERA_ALIASES = {
-    "top": "forward",
-    "alohamini_top": "forward",
-    "alohamini_forward": "forward",
-    "wrist": "wrist_right",
-    "alohamini_wrist": "wrist_right",
-    "alohamini_wrist_right": "wrist_right",
-    "alohamini_wrist_left": "wrist_left",
-    "alohamini_chest": "chest",
-}
+# Single naming scheme end to end (Pi config -> ZMQ topics -> HTTP -> go2rtc).
 
 
 def is_private_ip(ip_str: str) -> bool:
@@ -111,8 +101,6 @@ class ZMQCameraStreamSubscriber:
                     jpeg_bytes = parts[2]
                     with self._lock:
                         # Store only the exact topic and its physical base name.
-                        # Legacy names (top/wrist/...) resolve via LEGACY_CAMERA_ALIASES
-                        # at lookup time so /api/cameras never lists duplicates.
                         self.latest_frames[topic] = jpeg_bytes
                         self.latest_frames[topic.removeprefix("camera/")] = jpeg_bytes
                         try:
@@ -126,19 +114,13 @@ class ZMQCameraStreamSubscriber:
         ctx.term()
 
     def get_latest_frame(self, camera_name: str) -> bytes | None:
-        # Legacy compat: top/alohamini_* resolve to physical cameras at lookup.
-        camera_name = LEGACY_CAMERA_ALIASES.get(camera_name, camera_name)
         with self._lock:
-            # Try direct lookup, topic lookup, or return any frame if only one camera exists
+            # Direct lookup, then topic lookup. Unknown names return None
+            # so HTTP serves 404 instead of a misleading random camera.
             frame = self.latest_frames.get(camera_name)
             if frame is not None:
                 return frame
-            frame = self.latest_frames.get(f"camera/{camera_name}")
-            if frame is not None:
-                return frame
-            if self.latest_frames:
-                return next(iter(self.latest_frames.values()))
-            return None
+            return self.latest_frames.get(f"camera/{camera_name}")
 
     def get_available_cameras(self) -> list[str]:
         # Only physical cameras (camera/<name> topics), never legacy aliases.
@@ -288,11 +270,9 @@ class VideoBridge:
         http_base = f"http://127.0.0.1:{self.config.camera_http_port}"
         streams = {
             "alohamini_forward": f"{http_base}/stream/forward",
-            "alohamini_top": f"{http_base}/stream/forward",  # legacy: top == forward
             "alohamini_backward": f"{http_base}/stream/backward",
             "alohamini_chest": f"{http_base}/stream/chest",
             "alohamini_wrist_left": f"{http_base}/stream/wrist_left",
-            "alohamini_wrist": f"{http_base}/stream/wrist_right",  # legacy name
             "alohamini_wrist_right": f"{http_base}/stream/wrist_right",
         }
         success = True
