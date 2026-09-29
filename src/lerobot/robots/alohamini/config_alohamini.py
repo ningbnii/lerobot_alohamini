@@ -29,9 +29,13 @@ def alohamini_cameras_config() -> dict[str, CameraConfig]:
             height=480,
             rotation=Cv2Rotation.NO_ROTATION,
         ),
-        # "backward": OpenCVCameraConfig(
-        #     index_or_path="/dev/am_camera_backward", fps=30, width=640, height=480, rotation=Cv2Rotation.NO_ROTATION
-        # ),
+        "backward": OpenCVCameraConfig(
+            index_or_path="/dev/am_camera_backward",
+            fps=30,
+            width=640,
+            height=480,
+            rotation=Cv2Rotation.NO_ROTATION,
+        ),
         "chest": OpenCVCameraConfig(
             index_or_path="/dev/am_camera_chest",
             fps=30,

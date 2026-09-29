@@ -289,6 +289,7 @@ class VideoBridge:
         streams = {
             "alohamini_forward": f"{http_base}/stream/forward",
             "alohamini_top": f"{http_base}/stream/forward",  # legacy: top == forward
+            "alohamini_backward": f"{http_base}/stream/backward",
             "alohamini_chest": f"{http_base}/stream/chest",
             "alohamini_wrist_left": f"{http_base}/stream/wrist_left",
             "alohamini_wrist": f"{http_base}/stream/wrist_right",  # legacy name
