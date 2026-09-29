@@ -68,7 +68,11 @@ class ZMQCameraStreamSubscriber:
         import zmq
         ctx = zmq.Context()
         sock = ctx.socket(zmq.SUB)
-        sock.setsockopt(zmq.CONFLATE, 1)  # only keep latest frame per camera
+        # NOTE: CONFLATE must NOT be used here: it only supports single-part
+        # messages and aborts the process (fq.cpp:80 assert) on multipart
+        # [topic, meta, jpeg] frames. RCVHWM=1 + drain-to-latest below gives
+        # the same "latest frame only" behaviour safely.
+        sock.setsockopt(zmq.RCVHWM, 1)
         sock.setsockopt_string(zmq.SUBSCRIBE, "")  # subscribe to all topics
         sock.connect(self.endpoint)
 
@@ -79,34 +83,41 @@ class ZMQCameraStreamSubscriber:
             try:
                 socks = dict(poller.poll(500))
                 if sock in socks and socks[sock] == zmq.POLLIN:
-                    parts = sock.recv_multipart(flags=zmq.NOBLOCK)
-                    if len(parts) >= 3:
-                        topic = parts[0].decode("utf-8")
-                        meta_raw = parts[1].decode("utf-8")
-                        jpeg_bytes = parts[2]
-                        with self._lock:
-                            # Register exact topic and friendly aliases
-                            self.latest_frames[topic] = jpeg_bytes
-                            base_name = topic.removeprefix("camera/")
-                            self.latest_frames[base_name] = jpeg_bytes
+                    # Drain queue, keep only the newest multipart frame.
+                    parts = None
+                    while True:
+                        try:
+                            parts = sock.recv_multipart(flags=zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+                    if not parts or len(parts) < 3:
+                        continue
+                    topic = parts[0].decode("utf-8")
+                    meta_raw = parts[1].decode("utf-8")
+                    jpeg_bytes = parts[2]
+                    with self._lock:
+                        # Register exact topic and friendly aliases
+                        self.latest_frames[topic] = jpeg_bytes
+                        base_name = topic.removeprefix("camera/")
+                        self.latest_frames[base_name] = jpeg_bytes
 
-                            # Map forward camera to top/alohamini_top aliases
-                            if base_name in ("forward", "am_camera_forward"):
-                                self.latest_frames["forward"] = jpeg_bytes
-                                self.latest_frames["top"] = jpeg_bytes
-                                self.latest_frames["alohamini_top"] = jpeg_bytes
-                                self.latest_frames["alohamini_forward"] = jpeg_bytes
+                        # Map forward camera to top/alohamini_top aliases
+                        if base_name in ("forward", "am_camera_forward"):
+                            self.latest_frames["forward"] = jpeg_bytes
+                            self.latest_frames["top"] = jpeg_bytes
+                            self.latest_frames["alohamini_top"] = jpeg_bytes
+                            self.latest_frames["alohamini_forward"] = jpeg_bytes
 
-                            # Map wrist camera to wrist/alohamini_wrist aliases
-                            if "wrist" in base_name:
-                                self.latest_frames["wrist"] = jpeg_bytes
-                                self.latest_frames["wrist_right"] = jpeg_bytes
-                                self.latest_frames["alohamini_wrist"] = jpeg_bytes
+                        # Map wrist camera to wrist/alohamini_wrist aliases
+                        if "wrist" in base_name:
+                            self.latest_frames["wrist"] = jpeg_bytes
+                            self.latest_frames["wrist_right"] = jpeg_bytes
+                            self.latest_frames["alohamini_wrist"] = jpeg_bytes
 
-                            try:
-                                self.latest_metadata[topic] = json.loads(meta_raw)
-                            except Exception:
-                                pass
+                        try:
+                            self.latest_metadata[topic] = json.loads(meta_raw)
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.debug("ZMQ subscriber read notice: %s", e)
 
